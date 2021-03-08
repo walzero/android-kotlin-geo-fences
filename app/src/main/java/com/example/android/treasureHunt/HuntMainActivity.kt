@@ -66,7 +66,7 @@ class HuntMainActivity : AppCompatActivity() {
 
     private var requestPermission =
         registerForActivityResult(RequestMultiplePermissions()) { results ->
-            if(results.isNotEmpty() && results.all { it.value }) {
+            if (results.size == 2 && results.all { it.value }) {
                 checkDeviceLocationSettingsAndStartGeofence()
                 return@registerForActivityResult
             }
@@ -141,11 +141,13 @@ class HuntMainActivity : AppCompatActivity() {
      */
     private fun checkPermissionsAndStartGeofencing() {
         if (viewModel.geofenceIsActive()) return
-        if (foregroundAndBackgroundLocationPermissionApproved()) {
-            checkDeviceLocationSettingsAndStartGeofence()
-        } else {
-            requestForegroundAndBackgroundLocationPermissions()
+
+        if (!foregroundAndBackgroundLocationPermissionApproved()) {
+            requestPermission.launch(requiredPermissions.toTypedArray())
+            return
         }
+
+        checkDeviceLocationSettingsAndStartGeofence()
     }
 
     /*
@@ -180,14 +182,6 @@ class HuntMainActivity : AppCompatActivity() {
             }
 
         return foregroundLocationApproved && backgroundPermissionApproved
-    }
-
-    /*
-     *  Requests ACCESS_FINE_LOCATION and (on Android 10+ (Q) ACCESS_BACKGROUND_LOCATION.
-     */
-    @TargetApi(29)
-    private fun requestForegroundAndBackgroundLocationPermissions() {
-        requestPermission.launch(requiredPermissions.toTypedArray())
     }
 
     /*
