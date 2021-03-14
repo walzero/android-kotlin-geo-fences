@@ -17,13 +17,18 @@
 package com.example.android.treasureHunt
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.annotation.TargetApi
+import android.app.PendingIntent
 import android.content.Intent
+import android.content.IntentSender
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -31,7 +36,8 @@ import androidx.databinding.DataBindingUtil
 import androidx.lifecycle.SavedStateViewModelFactory
 import androidx.lifecycle.ViewModelProvider
 import com.example.android.treasureHunt.databinding.ActivityHuntMainBinding
-import com.google.android.gms.location.GeofencingClient
+import com.google.android.gms.common.api.ResolvableApiException
+import com.google.android.gms.location.*
 import com.google.android.material.snackbar.Snackbar
 
 /**
@@ -53,6 +59,15 @@ class HuntMainActivity : AppCompatActivity() {
     private lateinit var viewModel: GeofenceViewModel
 
     private fun runningQOrLater() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+
+    // A PendingIntent for the Broadcast Receiver that handles geofence transitions.
+    private val geofencePendingIntent: PendingIntent by lazy {
+        val intent = Intent(this, GeofenceBroadcastReceiver::class.java)
+        intent.action = ACTION_GEOFENCE_EVENT
+        // Use FLAG_UPDATE_CURRENT so that you get the same pending intent back when calling
+        // addGeofences() and removeGeofences().
+        PendingIntent.getBroadcast(this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT)
+    }
 
     private val requiredPermissions by lazy {
         val permissions = arrayListOf(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -88,7 +103,7 @@ class HuntMainActivity : AppCompatActivity() {
         ).get(GeofenceViewModel::class.java)
         binding.viewmodel = viewModel
         binding.lifecycleOwner = this
-        // TODO: Step 9 instantiate the geofencing client
+        geofencingClient = LocationServices.getGeofencingClient(this)
 
         // Create channel for notifications
         createChannel(this)
@@ -106,8 +121,9 @@ class HuntMainActivity : AppCompatActivity() {
  */
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        // TODO: Step 7 add code to check that the user turned on their device location and ask
-        //  again if they did not
+        if (requestCode == REQUEST_TURN_DEVICE_LOCATION_ON) {
+            checkDeviceLocationSettingsAndStartGeofence(false)
+        }
     }
 
     /*
@@ -155,7 +171,37 @@ class HuntMainActivity : AppCompatActivity() {
      *  the opportunity to turn on location services within our app.
      */
     private fun checkDeviceLocationSettingsAndStartGeofence(resolve: Boolean = true) {
-        // TODO: Step 6 add code to check that the device's location is on
+        val locationRequest = LocationRequest.create().apply {
+            priority = LocationRequest.PRIORITY_LOW_POWER
+        }
+        val builder = LocationSettingsRequest.Builder().addLocationRequest(locationRequest)
+        val settingsClient = LocationServices.getSettingsClient(this)
+        val locationSettingsResponseTask =
+            settingsClient.checkLocationSettings(builder.build())
+        locationSettingsResponseTask.addOnFailureListener { exception ->
+            if (exception is ResolvableApiException && resolve) {
+                try {
+                    exception.startResolutionForResult(
+                        this@HuntMainActivity,
+                        REQUEST_TURN_DEVICE_LOCATION_ON
+                    )
+                } catch (sendEx: IntentSender.SendIntentException) {
+                    Log.d(TAG, "Error getting location settings resolution: " + sendEx.message)
+                }
+            } else {
+                Snackbar.make(
+                    binding.activityMapsMain,
+                    R.string.location_required_error, Snackbar.LENGTH_INDEFINITE
+                ).setAction(android.R.string.ok) {
+                    checkDeviceLocationSettingsAndStartGeofence()
+                }.show()
+            }
+        }
+        locationSettingsResponseTask.addOnCompleteListener {
+            if (it.isSuccessful) {
+                addGeofenceForClue()
+            }
+        }
     }
 
     /*
@@ -190,8 +236,57 @@ class HuntMainActivity : AppCompatActivity() {
      * no more geofences, we remove the geofence and let the viewmodel know that the ending hint
      * is now "active."
      */
+    @SuppressLint("MissingPermission")
     private fun addGeofenceForClue() {
-        // TODO: Step 10 add in code to add the geofence
+        if (viewModel.geofenceIsActive()) return
+        val currentGeofenceIndex = viewModel.nextGeofenceIndex()
+        if (currentGeofenceIndex >= GeofencingConstants.NUM_LANDMARKS) {
+            removeGeofences()
+            viewModel.geofenceActivated()
+            return
+        }
+        val currentGeofenceData = GeofencingConstants.LANDMARK_DATA[currentGeofenceIndex]
+
+        val geofence = Geofence.Builder()
+            .setRequestId(currentGeofenceData.id)
+            .setCircularRegion(
+                currentGeofenceData.latLong.latitude,
+                currentGeofenceData.latLong.longitude,
+                GeofencingConstants.GEOFENCE_RADIUS_IN_METERS
+            )
+            .setExpirationDuration(GeofencingConstants.GEOFENCE_EXPIRATION_IN_MILLISECONDS)
+            .setTransitionTypes(Geofence.GEOFENCE_TRANSITION_ENTER)
+            .build()
+
+        val geofencingRequest = GeofencingRequest.Builder()
+            .setInitialTrigger(GeofencingRequest.INITIAL_TRIGGER_ENTER)
+            .addGeofence(geofence)
+            .build()
+
+        geofencingClient.removeGeofences(geofencePendingIntent).run {
+            addOnCompleteListener {
+                geofencingClient.addGeofences(geofencingRequest, geofencePendingIntent)?.run {
+                    addOnSuccessListener {
+                        Toast.makeText(
+                            this@HuntMainActivity, R.string.geofences_added,
+                            Toast.LENGTH_SHORT
+                        )
+                            .show()
+                        Log.e("Add Geofence", geofence.requestId)
+                        viewModel.geofenceActivated()
+                    }
+                    addOnFailureListener {
+                        Toast.makeText(
+                            this@HuntMainActivity, R.string.geofences_not_added,
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        if ((it.message != null)) {
+                            Log.w(TAG, it.message ?: "")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /**
@@ -199,7 +294,21 @@ class HuntMainActivity : AppCompatActivity() {
      * permission.
      */
     private fun removeGeofences() {
-        // TODO: Step 12 add in code to remove the geofences
+        if (!foregroundAndBackgroundLocationPermissionApproved()) {
+            return
+        }
+        geofencingClient.removeGeofences(geofencePendingIntent)?.run {
+            addOnSuccessListener {
+                // Geofences removed
+                Log.d(TAG, getString(R.string.geofences_removed))
+                Toast.makeText(applicationContext, R.string.geofences_removed, Toast.LENGTH_SHORT)
+                    .show()
+            }
+            addOnFailureListener {
+                // Failed to remove geofences
+                Log.d(TAG, getString(R.string.geofences_not_removed))
+            }
+        }
     }
 
     private fun showPermissionRequiredSnackBar() {
